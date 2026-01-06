@@ -81,6 +81,11 @@ Run 2 scouts in parallel: one to find models, one to find providers
 Use a chain: first have scout find the read tool, then have planner suggest improvements
 ```
 
+### Parallel then chain (fan-out/fan-in)
+```
+Use a chain with a parallel first step: run 2 scouts in parallel to find auth and models, then have planner create a unified plan from the results
+```
+
 ### Workflow prompts
 ```
 /implement add Redis caching to the session store
@@ -95,6 +100,31 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Single | `{ agent, task }` | One agent, one task |
 | Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
+
+### Chain with Parallel Steps
+
+Chain steps can include parallel execution for fan-out/fan-in patterns:
+
+```
+chain: [
+  { parallel: [
+    { agent: "scout", task: "find auth code" },
+    { agent: "scout", task: "find database models" },
+  ]},
+  { agent: "planner", task: "create plan based on: {previous}" }
+]
+```
+
+When a parallel step completes, `{previous}` contains all outputs:
+```
+[scout]
+<auth findings>
+
+---
+
+[scout]
+<model findings>
+```
 
 ## Output Display
 

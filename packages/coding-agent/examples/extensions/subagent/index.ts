@@ -381,10 +381,18 @@ const TaskItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
-const ChainItem = Type.Object({
+const ChainSingleItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+});
+
+const ChainParallelItem = Type.Object({
+	parallel: Type.Array(TaskItem, { description: "Array of tasks to run in parallel" }),
+});
+
+const ChainItem = Type.Union([ChainSingleItem, ChainParallelItem], {
+	description: "A chain step: either a single {agent, task} or {parallel: [{agent, task}, ...]}",
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -396,7 +404,12 @@ const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+	chain: Type.Optional(
+		Type.Array(ChainItem, {
+			description:
+				"Array for sequential execution. Each step is either {agent, task} or {parallel: [{agent, task}, ...]}. Use {previous} placeholder to reference prior step output.",
+		}),
+	),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
@@ -411,6 +424,7 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Chain steps can be parallel: { parallel: [{agent, task}, ...] } for fan-out/fan-in patterns.",
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
 		].join(" "),
@@ -451,7 +465,15 @@ export default function (pi: ExtensionAPI) {
 
 			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
 				const requestedAgentNames = new Set<string>();
-				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
+				if (params.chain) {
+					for (const step of params.chain) {
+						if ("parallel" in step) {
+							for (const t of step.parallel) requestedAgentNames.add(t.agent);
+						} else {
+							requestedAgentNames.add(step.agent);
+						}
+					}
+				}
 				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
 				if (params.agent) requestedAgentNames.add(params.agent);
 
@@ -480,51 +502,174 @@ export default function (pi: ExtensionAPI) {
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					const isParallelStep = "parallel" in step;
 
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
+					if (isParallelStep) {
+						// Parallel step within chain
+						const parallelTasks = step.parallel;
+						if (parallelTasks.length > MAX_PARALLEL_TASKS) {
+							return {
+								content: [
+									{
+										type: "text",
+										text: `Chain step ${i + 1}: too many parallel tasks (${parallelTasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+									},
+								],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+
+						// Track parallel results for streaming
+						const parallelResults: SingleResult[] = new Array(parallelTasks.length);
+						for (let j = 0; j < parallelTasks.length; j++) {
+							parallelResults[j] = {
+								agent: parallelTasks[j].agent,
+								agentSource: "unknown",
+								task: parallelTasks[j].task,
+								exitCode: -1,
+								messages: [],
+								stderr: "",
+								usage: {
+									input: 0,
+									output: 0,
+									cacheRead: 0,
+									cacheWrite: 0,
+									cost: 0,
+									contextTokens: 0,
+									turns: 0,
+								},
+								step: i + 1,
+							};
+						}
+
+						const emitParallelUpdate = () => {
+							if (onUpdate) {
+								onUpdate({
+									content: [{ type: "text", text: "(parallel step running...)" }],
+									details: makeDetails("chain")([...results, ...parallelResults]),
+								});
 							}
-						: undefined;
-
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
-					results.push(result);
-
-					const isError =
-						result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-					if (isError) {
-						const errorMsg =
-							result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
 						};
+
+						const stepResults = await mapWithConcurrencyLimit(
+							parallelTasks,
+							MAX_CONCURRENCY,
+							async (t, index) => {
+								const taskWithContext = t.task.replace(/\{previous\}/g, previousOutput);
+								const result = await runSingleAgent(
+									ctx.cwd,
+									agents,
+									t.agent,
+									taskWithContext,
+									t.cwd,
+									i + 1,
+									signal,
+									(partial) => {
+										if (partial.details?.results[0]) {
+											parallelResults[index] = { ...partial.details.results[0], step: i + 1 };
+											emitParallelUpdate();
+										}
+									},
+									makeDetails("chain"),
+								);
+								result.step = i + 1;
+								parallelResults[index] = result;
+								emitParallelUpdate();
+								return result;
+							},
+						);
+
+						// Check for errors in parallel results
+						const failedResults = stepResults.filter(
+							(r) => r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted",
+						);
+						if (failedResults.length > 0) {
+							results.push(...stepResults);
+							const failedAgents = failedResults.map((r) => r.agent).join(", ");
+							return {
+								content: [
+									{ type: "text", text: `Chain stopped at step ${i + 1} (parallel): ${failedAgents} failed` },
+								],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+
+						results.push(...stepResults);
+
+						// Combine all parallel outputs for {previous}
+						const outputs = stepResults.map((r) => {
+							const output = getFinalOutput(r.messages);
+							return `[${r.agent}]\n${output || "(no output)"}`;
+						});
+						previousOutput = outputs.join("\n\n---\n\n");
+					} else {
+						// Single agent step
+						const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+
+						// Create update callback that includes all previous results
+						const chainUpdate: OnUpdateCallback | undefined = onUpdate
+							? (partial) => {
+									const currentResult = partial.details?.results[0];
+									if (currentResult) {
+										const allResults = [...results, currentResult];
+										onUpdate({
+											content: partial.content,
+											details: makeDetails("chain")(allResults),
+										});
+									}
+								}
+							: undefined;
+
+						const result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							step.agent,
+							taskWithContext,
+							step.cwd,
+							i + 1,
+							signal,
+							chainUpdate,
+							makeDetails("chain"),
+						);
+						results.push(result);
+
+						const isError =
+							result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+						if (isError) {
+							const errorMsg =
+								result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+							return {
+								content: [
+									{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` },
+								],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+						previousOutput = getFinalOutput(result.messages);
 					}
-					previousOutput = getFinalOutput(result.messages);
 				}
+
+				// Get final output - could be from single or parallel step
+				const lastStep = params.chain[params.chain.length - 1];
+				let finalOutput: string;
+				if ("parallel" in lastStep) {
+					// Last step was parallel - combine outputs
+					const lastParallelCount = lastStep.parallel.length;
+					const lastResults = results.slice(-lastParallelCount);
+					const outputs = lastResults.map((r) => {
+						const output = getFinalOutput(r.messages);
+						return `[${r.agent}]\n${output || "(no output)"}`;
+					});
+					finalOutput = outputs.join("\n\n---\n\n");
+				} else {
+					finalOutput = getFinalOutput(results[results.length - 1].messages);
+				}
+
 				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+					content: [{ type: "text", text: finalOutput || "(no output)" }],
 					details: makeDetails("chain")(results),
 				};
 			}
@@ -596,14 +741,13 @@ export default function (pi: ExtensionAPI) {
 				const successCount = results.filter((r) => r.exitCode === 0).length;
 				const summaries = results.map((r) => {
 					const output = getFinalOutput(r.messages);
-					const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
-					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || "(no output)"}`;
+					return `[${r.agent}]\n${output || "(no output)"}`;
 				});
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
+							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
 						},
 					],
 					details: makeDetails("parallel")(results),
@@ -654,15 +798,26 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("muted", ` [${scope}]`);
 				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
 					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
-					text +=
-						"\n  " +
-						theme.fg("muted", `${i + 1}.`) +
-						" " +
-						theme.fg("accent", step.agent) +
-						theme.fg("dim", ` ${preview}`);
+					if ("parallel" in step) {
+						// Parallel step
+						const agentNames = step.parallel.map((t: { agent: string }) => t.agent).join(", ");
+						text +=
+							"\n  " +
+							theme.fg("muted", `${i + 1}.`) +
+							" " +
+							theme.fg("warning", "parallel: ") +
+							theme.fg("accent", agentNames);
+					} else {
+						// Single step
+						const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
+						const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
+						text +=
+							"\n  " +
+							theme.fg("muted", `${i + 1}.`) +
+							" " +
+							theme.fg("accent", step.agent) +
+							theme.fg("dim", ` ${preview}`);
+					}
 				}
 				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
 				return new Text(text, 0, 0);
