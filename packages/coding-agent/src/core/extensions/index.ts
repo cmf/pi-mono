@@ -20,6 +20,7 @@ export type {
 export { ExtensionRunner } from "./runner.js";
 export type {
 	AgentEndEvent,
+	AgentSettledEvent,
 	AgentStartEvent,
 	// Re-exports
 	AgentToolResult,
@@ -49,6 +50,7 @@ export type {
 	ExecResult,
 	Extension,
 	ExtensionActions,
+	ExtensionAgentSettledContext,
 	// API
 	ExtensionAPI,
 	ExtensionCommandContext,

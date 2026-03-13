@@ -707,7 +707,8 @@ Events are streamed to stdout as JSON lines during agent operation. Events do NO
 | Event | Description |
 |-------|-------------|
 | `agent_start` | Agent begins processing |
-| `agent_end` | Agent completes (includes all generated messages) |
+| `agent_end` | Agent run completes (single loop run) |
+| `agent_settled` | Session fully settles (safe to mutate tree state) |
 | `turn_start` | New turn begins |
 | `turn_end` | Turn completes (includes assistant message and tool results) |
 | `message_start` | Message begins |
@@ -732,7 +733,7 @@ Emitted when the agent begins processing a prompt.
 
 ### agent_end
 
-Emitted when the agent completes. Contains all messages generated during this run.
+Emitted when a single agent run completes. Contains messages from that run.
 
 ```json
 {
@@ -740,6 +741,21 @@ Emitted when the agent completes. Contains all messages generated during this ru
   "messages": [...]
 }
 ```
+
+A later continuation may still run after `agent_end` (for retries/compaction/follow-up orchestration).
+
+### agent_settled
+
+Emitted when the session is fully settled after a run: no streaming, no queued continuation, and no internal scheduled continue.
+
+```json
+{
+  "type": "agent_settled",
+  "messages": [...]
+}
+```
+
+If run A triggers run B, run A emits `agent_end` but not `agent_settled`; only the final settled run emits `agent_settled`.
 
 ### turn_start / turn_end
 

@@ -254,7 +254,8 @@ user sends prompt ────────────────────�
   │   │                                            │       │
   │   └─► turn_end                                 │       │
   │                                                        │
-  └─► agent_end                                            │
+  ├─► agent_end                                            │
+  └─► agent_settled (only when fully settled)              │
                                                            │
 user sends another prompt ◄────────────────────────────────┘
 
@@ -412,15 +413,22 @@ pi.on("before_agent_start", async (event, ctx) => {
 });
 ```
 
-#### agent_start / agent_end
+#### agent_start / agent_end / agent_settled
 
-Fired once per user prompt.
+`agent_start` and `agent_end` are fired for each run.
+
+`agent_settled` is fired only when the run is fully settled (no queued continuation or internal scheduled continue). Use it when you need safe session tree mutation after a run.
 
 ```typescript
 pi.on("agent_start", async (_event, ctx) => {});
 
 pi.on("agent_end", async (event, ctx) => {
-  // event.messages - messages from this prompt
+  // event.messages - messages from this run
+});
+
+pi.on("agent_settled", async (event, ctx) => {
+  // ctx only exposes ExtensionContext + navigateTree()
+  await ctx.navigateTree("entry-id", { summarize: false });
 });
 ```
 
@@ -775,6 +783,19 @@ pi.registerCommand("my-cmd", {
   handler: async (args, ctx) => {
     await ctx.waitForIdle();
     // Agent is now idle, safe to modify session
+  },
+});
+```
+
+### ctx.waitForSettled()
+
+Wait for the session lifecycle to settle (stronger than `waitForIdle()`).
+
+```typescript
+pi.registerCommand("wait-settled", {
+  handler: async (_args, ctx) => {
+    await ctx.waitForSettled();
+    // No streaming, no queued continuation, no internal scheduled continue
   },
 });
 ```

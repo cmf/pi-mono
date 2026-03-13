@@ -13,6 +13,7 @@ Events are defined in [`AgentSessionEvent`](https://github.com/badlogic/pi-mono/
 ```typescript
 type AgentSessionEvent =
   | AgentEvent
+  | { type: "agent_settled"; messages: AgentMessage[] }
   | { type: "auto_compaction_start"; reason: "threshold" | "overflow" }
   | { type: "auto_compaction_end"; result: CompactionResult | undefined; aborted: boolean; willRetry: boolean; errorMessage?: string }
   | { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
@@ -70,7 +71,10 @@ Followed by events as they occur:
 {"type":"message_end","message":{...}}
 {"type":"turn_end","message":{...},"toolResults":[]}
 {"type":"agent_end","messages":[...]}
+{"type":"agent_settled","messages":[...]}
 ```
+
+`agent_end` means a single run finished. `agent_settled` means the session is safe for tree mutation (no queued continuation, no internal auto-continue pending).
 
 ## Example
 

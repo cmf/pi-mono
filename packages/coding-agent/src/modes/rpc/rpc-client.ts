@@ -5,13 +5,20 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import type { AgentEvent, AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ImageContent } from "@mariozechner/pi-ai";
-import type { SessionStats } from "../../core/agent-session.js";
+import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.js";
+import type {
+	RpcAgentSessionEvent,
+	RpcCommand,
+	RpcEvent,
+	RpcResponse,
+	RpcSessionState,
+	RpcSlashCommand,
+} from "./rpc-types.js";
 
 // ============================================================================
 // Types
@@ -45,7 +52,20 @@ export interface ModelInfo {
 	reasoning: boolean;
 }
 
-export type RpcEventListener = (event: AgentEvent) => void;
+export interface RpcLifecycleHandle {
+	requestId: string;
+	waitForIdle(timeout?: number): Promise<void>;
+	collectEvents(timeout?: number): Promise<AgentSessionEvent[]>;
+}
+
+interface RequestLifecycleTracker {
+	requestId: string;
+	idleState: "pending" | "ended" | "failed";
+	error?: Error;
+	cleanupTimer?: ReturnType<typeof setTimeout>;
+}
+
+export type RpcEventListener = (event: RpcEvent) => void;
 
 // ============================================================================
 // RPC Client
@@ -59,6 +79,10 @@ export class RpcClient {
 		new Map();
 	private requestId = 0;
 	private stderr = "";
+	private isSettledState = false;
+	private pendingSettlementAffectingRequests = 0;
+	private settlementStateListeners = new Set<() => void>();
+	private requestLifecycleTrackers = new Map<string, RequestLifecycleTracker>();
 
 	constructor(private options: RpcClientOptions = {}) {}
 
@@ -105,6 +129,9 @@ export class RpcClient {
 		if (this.process.exitCode !== null) {
 			throw new Error(`Agent process exited immediately with code ${this.process.exitCode}. Stderr: ${this.stderr}`);
 		}
+
+		const state = await this.getState();
+		this.isSettledState = state.isSettled;
 	}
 
 	/**
@@ -132,6 +159,12 @@ export class RpcClient {
 
 		this.process = null;
 		this.pendingRequests.clear();
+		for (const tracker of this.requestLifecycleTrackers.values()) {
+			if (tracker.cleanupTimer) {
+				clearTimeout(tracker.cleanupTimer);
+			}
+		}
+		this.requestLifecycleTrackers.clear();
 	}
 
 	/**
@@ -163,22 +196,28 @@ export class RpcClient {
 	 * Returns immediately after sending; use onEvent() to receive streaming events.
 	 * Use waitForIdle() to wait for completion.
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "prompt", message, images });
+	async prompt(message: string, images?: ImageContent[]): Promise<RpcLifecycleHandle> {
+		const pendingCommand = this.startSettlementAffectingCommand({ type: "prompt", message, images });
+		await pendingCommand.responsePromise;
+		return this.createLifecycleHandle(pendingCommand.requestId);
 	}
 
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "steer", message, images });
+	async steer(message: string, images?: ImageContent[]): Promise<RpcLifecycleHandle> {
+		const pendingCommand = this.startSettlementAffectingCommand({ type: "steer", message, images });
+		await pendingCommand.responsePromise;
+		return this.createLifecycleHandle(pendingCommand.requestId);
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "follow_up", message, images });
+	async followUp(message: string, images?: ImageContent[]): Promise<RpcLifecycleHandle> {
+		const pendingCommand = this.startSettlementAffectingCommand({ type: "follow_up", message, images });
+		await pendingCommand.responsePromise;
+		return this.createLifecycleHandle(pendingCommand.requestId);
 	}
 
 	/**
@@ -203,7 +242,9 @@ export class RpcClient {
 	 */
 	async getState(): Promise<RpcSessionState> {
 		const response = await this.send({ type: "get_state" });
-		return this.getData(response);
+		const state = this.getData<RpcSessionState>(response);
+		this.isSettledState = state.isSettled;
+		return state;
 	}
 
 	/**
@@ -384,16 +425,225 @@ export class RpcClient {
 	// Helpers
 	// =========================================================================
 
-	/**
-	 * Wait for agent to become idle (no streaming).
-	 * Resolves when agent_end event is received.
-	 */
-	waitForIdle(timeout = 60000): Promise<void> {
+	private canResolveWaitForSettled(): boolean {
+		return this.isSettledState && this.pendingSettlementAffectingRequests === 0;
+	}
+
+	private notifySettlementStateChanged(): void {
+		for (const listener of this.settlementStateListeners) {
+			listener();
+		}
+	}
+
+	private getOrCreateRequestLifecycleTracker(requestId: string): RequestLifecycleTracker {
+		const existingTracker = this.requestLifecycleTrackers.get(requestId);
+		if (existingTracker) {
+			return existingTracker;
+		}
+
+		const tracker: RequestLifecycleTracker = {
+			requestId,
+			idleState: "pending",
+		};
+		this.requestLifecycleTrackers.set(requestId, tracker);
+		return tracker;
+	}
+
+	private scheduleRequestLifecycleTrackerCleanup(tracker: RequestLifecycleTracker): void {
+		if (tracker.cleanupTimer) {
+			clearTimeout(tracker.cleanupTimer);
+		}
+		tracker.cleanupTimer = setTimeout(() => {
+			if (this.requestLifecycleTrackers.get(tracker.requestId) === tracker) {
+				this.requestLifecycleTrackers.delete(tracker.requestId);
+			}
+		}, 60000);
+	}
+
+	private markRequestLifecycleFailure(requestId: string, error: Error): void {
+		const tracker = this.getOrCreateRequestLifecycleTracker(requestId);
+		if (tracker.idleState === "failed") {
+			this.scheduleRequestLifecycleTrackerCleanup(tracker);
+			return;
+		}
+		tracker.idleState = "failed";
+		tracker.error = error;
+		this.scheduleRequestLifecycleTrackerCleanup(tracker);
+	}
+
+	private markRequestLifecycleEnded(requestId: string): void {
+		const tracker = this.getOrCreateRequestLifecycleTracker(requestId);
+		if (tracker.idleState === "failed") {
+			this.scheduleRequestLifecycleTrackerCleanup(tracker);
+			return;
+		}
+		tracker.idleState = "ended";
+		tracker.error = undefined;
+		this.scheduleRequestLifecycleTrackerCleanup(tracker);
+	}
+
+	private getRequestLifecycleTerminalState(requestId: string): { ended: boolean; error?: Error } | undefined {
+		const tracker = this.requestLifecycleTrackers.get(requestId);
+		if (!tracker || tracker.idleState === "pending") {
+			return undefined;
+		}
+		return tracker.idleState === "failed" ? { ended: false, error: tracker.error } : { ended: true };
+	}
+
+	private createCommandError(event: Extract<RpcEvent, { type: "command_error" }>): Error {
+		return new Error(event.error);
+	}
+
+	private createLifecycleHandle(requestId: string): RpcLifecycleHandle {
+		const handle: RpcLifecycleHandle = {
+			requestId,
+			waitForIdle: (timeout = 60000) => this.waitForIdle(handle, timeout),
+			collectEvents: (timeout = 60000) => this.collectEvents(handle, timeout),
+		};
+		return handle;
+	}
+
+	private createRequestIdleWaiter(requestId: string, timeout: number): Promise<void> {
+		const terminalState = this.getRequestLifecycleTerminalState(requestId);
+		if (terminalState?.error) {
+			return Promise.reject(terminalState.error);
+		}
+		if (terminalState?.ended) {
+			return Promise.resolve();
+		}
+
 		return new Promise((resolve, reject) => {
+			let unsubscribe = () => {};
 			const timer = setTimeout(() => {
 				unsubscribe();
 				reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.stderr}`));
 			}, timeout);
+
+			unsubscribe = this.onEvent((event) => {
+				if (event.type === "command_error" && event.requestId === requestId) {
+					clearTimeout(timer);
+					unsubscribe();
+					reject(this.createCommandError(event));
+					return;
+				}
+				if (event.type === "agent_end" && event.requestId === requestId) {
+					clearTimeout(timer);
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+	}
+
+	private createRequestEventCollector(
+		requestId: string,
+		timeout: number,
+	): { promise: Promise<AgentSessionEvent[]>; cancel: (error: Error) => void } {
+		const terminalState = this.getRequestLifecycleTerminalState(requestId);
+		if (terminalState?.error) {
+			return {
+				promise: Promise.reject(terminalState.error),
+				cancel: () => {},
+			};
+		}
+		if (terminalState?.ended) {
+			return {
+				promise: Promise.resolve([]),
+				cancel: () => {},
+			};
+		}
+
+		const events: AgentSessionEvent[] = [];
+		let unsubscribe = () => {};
+		let finished = false;
+		let rejectPromise!: (error: Error) => void;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+
+		const finish = (callback: () => void): void => {
+			if (finished) {
+				return;
+			}
+			finished = true;
+			if (timer) {
+				clearTimeout(timer);
+			}
+			unsubscribe();
+			callback();
+		};
+
+		const promise = new Promise<AgentSessionEvent[]>((resolve, reject) => {
+			rejectPromise = reject;
+			timer = setTimeout(() => {
+				finish(() => reject(new Error(`Timeout collecting events. Stderr: ${this.stderr}`)));
+			}, timeout);
+
+			unsubscribe = this.onEvent((event) => {
+				if (event.type === "command_error" && event.requestId === requestId) {
+					finish(() => reject(this.createCommandError(event)));
+					return;
+				}
+				if (!this.isAgentSessionEvent(event)) {
+					return;
+				}
+				events.push(event);
+				if (event.type === "agent_end" && event.requestId === requestId) {
+					finish(() => resolve(events));
+				}
+			});
+		});
+
+		return {
+			promise,
+			cancel: (error) => {
+				finish(() => rejectPromise(error));
+			},
+		};
+	}
+
+	private startSettlementAffectingCommand(
+		command: Extract<RpcCommandBody, { type: "prompt" | "steer" | "follow_up" }>,
+	): { requestId: string; responsePromise: Promise<void> } {
+		const requestId = `req_${++this.requestId}`;
+		this.getOrCreateRequestLifecycleTracker(requestId);
+		this.pendingSettlementAffectingRequests++;
+		this.notifySettlementStateChanged();
+
+		const responsePromise = this.send(command, requestId)
+			.then((response) => {
+				const hasLifecycle = this.syncSettledStateFromResponse(response, requestId);
+				if (!hasLifecycle) {
+					this.markRequestLifecycleEnded(requestId);
+				}
+			})
+			.catch((error: unknown) => {
+				this.requestLifecycleTrackers.delete(requestId);
+				throw error;
+			});
+		void responsePromise
+			.finally(() => {
+				this.pendingSettlementAffectingRequests--;
+				this.notifySettlementStateChanged();
+			})
+			.catch(() => {});
+
+		return { requestId, responsePromise };
+	}
+
+	/**
+	 * Wait for agent to become idle (no streaming).
+	 * Resolves when agent_end event is received.
+	 */
+	waitForIdle(handleOrTimeout: RpcLifecycleHandle | number = 60000, timeout = 60000): Promise<void> {
+		if (typeof handleOrTimeout !== "number") {
+			return this.createRequestIdleWaiter(handleOrTimeout.requestId, timeout);
+		}
+
+		const globalTimeout = handleOrTimeout;
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				unsubscribe();
+				reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.stderr}`));
+			}, globalTimeout);
 
 			const unsubscribe = this.onEvent((event) => {
 				if (event.type === "agent_end") {
@@ -406,17 +656,65 @@ export class RpcClient {
 	}
 
 	/**
-	 * Collect events until agent becomes idle.
+	 * Wait for agent lifecycle to settle (no queued continuation).
+	 * Resolves when agent_settled event is received.
 	 */
-	collectEvents(timeout = 60000): Promise<AgentEvent[]> {
+	async waitForSettled(timeout = 60000): Promise<void> {
+		if (this.canResolveWaitForSettled()) {
+			return;
+		}
+
+		await new Promise<void>((resolve, reject) => {
+			let finished = false;
+			const finish = (error?: Error): void => {
+				if (finished) {
+					return;
+				}
+				finished = true;
+				clearTimeout(timer);
+				this.settlementStateListeners.delete(onStateChange);
+				if (error) {
+					reject(error);
+					return;
+				}
+				resolve();
+			};
+
+			const onStateChange = (): void => {
+				if (this.canResolveWaitForSettled()) {
+					finish();
+				}
+			};
+
+			const timer = setTimeout(() => {
+				finish(new Error(`Timeout waiting for agent to settle. Stderr: ${this.stderr}`));
+			}, timeout);
+
+			this.settlementStateListeners.add(onStateChange);
+			onStateChange();
+		});
+	}
+
+	/**
+	 * Collect events until agent becomes idle (`agent_end`), not until the session fully settles.
+	 */
+	collectEvents(handleOrTimeout: RpcLifecycleHandle | number = 60000, timeout = 60000): Promise<AgentSessionEvent[]> {
+		if (typeof handleOrTimeout !== "number") {
+			return this.createRequestEventCollector(handleOrTimeout.requestId, timeout).promise;
+		}
+
+		const globalTimeout = handleOrTimeout;
 		return new Promise((resolve, reject) => {
-			const events: AgentEvent[] = [];
+			const events: AgentSessionEvent[] = [];
 			const timer = setTimeout(() => {
 				unsubscribe();
 				reject(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
-			}, timeout);
+			}, globalTimeout);
 
 			const unsubscribe = this.onEvent((event) => {
+				if (!this.isAgentSessionEvent(event)) {
+					return;
+				}
 				events.push(event);
 				if (event.type === "agent_end") {
 					clearTimeout(timer);
@@ -428,12 +726,20 @@ export class RpcClient {
 	}
 
 	/**
-	 * Send prompt and wait for completion, returning all events.
+	 * Send prompt and wait until the agent becomes idle (`agent_end`), returning all events seen up to that point.
 	 */
-	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentSessionEvent[]> {
+		const pendingCommand = this.startSettlementAffectingCommand({ type: "prompt", message, images });
+		const collector = this.createRequestEventCollector(pendingCommand.requestId, timeout);
+		void collector.promise.catch(() => {});
+		try {
+			await pendingCommand.responsePromise;
+			return await collector.promise;
+		} catch (error) {
+			const normalizedError = error instanceof Error ? error : new Error(String(error));
+			collector.cancel(normalizedError);
+			throw normalizedError;
+		}
 	}
 
 	// =========================================================================
@@ -444,29 +750,72 @@ export class RpcClient {
 		try {
 			const data = JSON.parse(line);
 
-			// Check if it's a response to a pending request
-			if (data.type === "response" && data.id && this.pendingRequests.has(data.id)) {
-				const pending = this.pendingRequests.get(data.id)!;
-				this.pendingRequests.delete(data.id);
-				pending.resolve(data as RpcResponse);
+			if (data.type === "response") {
+				if (data.id && this.pendingRequests.has(data.id)) {
+					const response = data as RpcResponse;
+					const pending = this.pendingRequests.get(data.id)!;
+					this.pendingRequests.delete(data.id);
+					pending.resolve(response);
+				}
 				return;
 			}
 
-			// Otherwise it's an event
+			const event = data as RpcEvent;
+			if (event.type === "command_error") {
+				this.isSettledState = event.isSettled;
+				if (event.requestId) {
+					this.markRequestLifecycleFailure(event.requestId, this.createCommandError(event));
+				}
+			} else if (event.type === "agent_settled") {
+				this.isSettledState = true;
+			} else if (event.type === "agent_start" || event.type === "agent_end") {
+				this.isSettledState = false;
+				if (event.type === "agent_end" && event.requestId) {
+					this.markRequestLifecycleEnded(event.requestId);
+				}
+			}
+			this.notifySettlementStateChanged();
+
 			for (const listener of this.eventListeners) {
-				listener(data as AgentEvent);
+				listener(event);
 			}
 		} catch {
 			// Ignore non-JSON lines
 		}
 	}
 
-	private async send(command: RpcCommandBody): Promise<RpcResponse> {
+	private syncSettledStateFromResponse(response: RpcResponse, requestId: string): boolean {
+		if (!response.success) {
+			throw new Error(response.error);
+		}
+
+		if (response.command === "prompt" || response.command === "steer" || response.command === "follow_up") {
+			const data = response.data;
+			if (!data || typeof data !== "object" || !("isSettled" in data) || typeof data.isSettled !== "boolean") {
+				throw new Error(`Malformed ${response.command} response for ${requestId}`);
+			}
+			this.isSettledState = data.isSettled;
+			if ("hasLifecycle" in data) {
+				if (typeof data.hasLifecycle !== "boolean") {
+					throw new Error(`Malformed ${response.command} response for ${requestId}`);
+				}
+				return data.hasLifecycle;
+			}
+		}
+
+		return true;
+	}
+
+	private isAgentSessionEvent(event: RpcEvent): event is RpcAgentSessionEvent {
+		return event.type !== "command_error" && event.type !== "extension_error";
+	}
+
+	private async send(command: RpcCommandBody, requestId?: string): Promise<RpcResponse> {
 		if (!this.process?.stdin) {
 			throw new Error("Client not started");
 		}
 
-		const id = `req_${++this.requestId}`;
+		const id = requestId ?? `req_${++this.requestId}`;
 		const fullCommand = { ...command, id } as RpcCommand;
 
 		return new Promise((resolve, reject) => {

@@ -295,6 +295,9 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	/** Wait for the agent to finish streaming */
 	waitForIdle(): Promise<void>;
 
+	/** Wait for the agent turn lifecycle to settle (no queued continuation). */
+	waitForSettled(): Promise<void>;
+
 	/** Start a new session, optionally with initialization. */
 	newSession(options?: {
 		parentSession?: string;
@@ -315,6 +318,18 @@ export interface ExtensionCommandContext extends ExtensionContext {
 
 	/** Reload extensions, skills, prompts, and themes. */
 	reload(): Promise<void>;
+}
+
+/**
+ * Context for agent_settled handlers.
+ * Matches ExtensionContext and additionally allows safe tree navigation after full settlement.
+ */
+export interface ExtensionAgentSettledContext extends ExtensionContext {
+	/** Navigate to a different point in the session tree. */
+	navigateTree(
+		targetId: string,
+		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
+	): Promise<{ cancelled: boolean }>;
 }
 
 // ============================================================================
@@ -515,6 +530,15 @@ export interface AgentStartEvent {
 /** Fired when an agent loop ends */
 export interface AgentEndEvent {
 	type: "agent_end";
+	messages: AgentMessage[];
+}
+
+/**
+ * Fired when an agent run is fully settled (safe for tree mutation).
+ * agent_settled handler/listener errors are isolated and reported so settlement always completes.
+ */
+export interface AgentSettledEvent {
+	type: "agent_settled";
 	messages: AgentMessage[];
 }
 
@@ -817,6 +841,7 @@ export type ExtensionEvent =
 	| BeforeAgentStartEvent
 	| AgentStartEvent
 	| AgentEndEvent
+	| AgentSettledEvent
 	| TurnStartEvent
 	| TurnEndEvent
 	| MessageStartEvent
@@ -924,8 +949,13 @@ export interface RegisteredCommand {
 // ============================================================================
 
 /** Handler function type for events */
-// biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
-export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
+type ResultExtensionHandler<E, R, Ctx> = (event: E, ctx: Ctx) => Promise<R | undefined> | R | undefined;
+
+type VoidExtensionHandler<E, Ctx> = (event: E, ctx: Ctx) => Promise<void> | void;
+
+export type ExtensionHandler<E, R = undefined, Ctx = ExtensionContext> =
+	| ResultExtensionHandler<E, R, Ctx>
+	| VoidExtensionHandler<E, Ctx>;
 
 /**
  * ExtensionAPI passed to extension factory functions.
@@ -960,6 +990,10 @@ export interface ExtensionAPI {
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
+	on(
+		event: "agent_settled",
+		handler: ExtensionHandler<AgentSettledEvent, undefined, ExtensionAgentSettledContext>,
+	): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;
@@ -1342,6 +1376,7 @@ export interface ExtensionContextActions {
  */
 export interface ExtensionCommandContextActions {
 	waitForIdle: () => Promise<void>;
+	waitForSettled?: () => Promise<void>;
 	newSession: (options?: {
 		parentSession?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;

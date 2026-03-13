@@ -113,7 +113,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		const runAutoCompaction = (
 			session as unknown as {
-				_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
+				_runAutoCompaction: (
+					reason: "overflow" | "threshold",
+					willRetry: boolean,
+					guard?: { settlementEpoch: number; requestVersion: number },
+				) => Promise<void>;
 			}
 		)._runAutoCompaction.bind(session);
 
@@ -147,7 +151,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const runAutoCompactionSpy = vi
 			.spyOn(
 				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
+					_runAutoCompaction: (
+						reason: "overflow" | "threshold",
+						willRetry: boolean,
+						guard?: { settlementEpoch: number; requestVersion: number },
+					) => Promise<void>;
 				},
 				"_runAutoCompaction",
 			)
@@ -217,7 +225,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const runAutoCompactionSpy = vi
 			.spyOn(
 				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
+					_runAutoCompaction: (
+						reason: "overflow" | "threshold",
+						willRetry: boolean,
+						guard?: { settlementEpoch: number; requestVersion: number },
+					) => Promise<void>;
 				},
 				"_runAutoCompaction",
 			)
@@ -287,7 +299,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const runAutoCompactionSpy = vi
 			.spyOn(
 				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
+					_runAutoCompaction: (
+						reason: "overflow" | "threshold",
+						willRetry: boolean,
+						guard?: { settlementEpoch: number; requestVersion: number },
+					) => Promise<void>;
 				},
 				"_runAutoCompaction",
 			)
@@ -301,7 +317,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		await checkCompaction(errorAssistant);
 
-		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false, undefined);
 	});
 
 	it("should not trigger threshold compaction for error messages when no prior usage exists", async () => {
@@ -335,7 +351,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const runAutoCompactionSpy = vi
 			.spyOn(
 				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
+					_runAutoCompaction: (
+						reason: "overflow" | "threshold",
+						willRetry: boolean,
+						guard?: { settlementEpoch: number; requestVersion: number },
+					) => Promise<void>;
 				},
 				"_runAutoCompaction",
 			)
@@ -416,7 +436,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const runAutoCompactionSpy = vi
 			.spyOn(
 				session as unknown as {
-					_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
+					_runAutoCompaction: (
+						reason: "overflow" | "threshold",
+						willRetry: boolean,
+						guard?: { settlementEpoch: number; requestVersion: number },
+					) => Promise<void>;
 				},
 				"_runAutoCompaction",
 			)

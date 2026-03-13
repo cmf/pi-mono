@@ -20,6 +20,7 @@ import type {
 	ContextUsage,
 	Extension,
 	ExtensionActions,
+	ExtensionAgentSettledContext,
 	ExtensionCommandContext,
 	ExtensionCommandContextActions,
 	ExtensionContext,
@@ -206,6 +207,7 @@ export class ExtensionRunner {
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private isIdleFn: () => boolean = () => true;
 	private waitForIdleFn: () => Promise<void> = async () => {};
+	private waitForSettledFn: () => Promise<void> = async () => {};
 	private abortFn: () => void = () => {};
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
@@ -277,6 +279,7 @@ export class ExtensionRunner {
 	bindCommandContext(actions?: ExtensionCommandContextActions): void {
 		if (actions) {
 			this.waitForIdleFn = actions.waitForIdle;
+			this.waitForSettledFn = actions.waitForSettled ?? (async () => {});
 			this.newSessionHandler = actions.newSession;
 			this.forkHandler = actions.fork;
 			this.navigateTreeHandler = actions.navigateTree;
@@ -286,6 +289,7 @@ export class ExtensionRunner {
 		}
 
 		this.waitForIdleFn = async () => {};
+		this.waitForSettledFn = async () => {};
 		this.newSessionHandler = async () => ({ cancelled: false });
 		this.forkHandler = async () => ({ cancelled: false });
 		this.navigateTreeHandler = async () => ({ cancelled: false });
@@ -527,11 +531,19 @@ export class ExtensionRunner {
 		return {
 			...this.createContext(),
 			waitForIdle: () => this.waitForIdleFn(),
+			waitForSettled: () => this.waitForSettledFn(),
 			newSession: (options) => this.newSessionHandler(options),
 			fork: (entryId) => this.forkHandler(entryId),
 			navigateTree: (targetId, options) => this.navigateTreeHandler(targetId, options),
 			switchSession: (sessionPath) => this.switchSessionHandler(sessionPath),
 			reload: () => this.reloadHandler(),
+		};
+	}
+
+	createSettledContext(): ExtensionAgentSettledContext {
+		return {
+			...this.createContext(),
+			navigateTree: (targetId, options) => this.navigateTreeHandler(targetId, options),
 		};
 	}
 
@@ -545,7 +557,7 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
-		const ctx = this.createContext();
+		const ctx = event.type === "agent_settled" ? this.createSettledContext() : this.createContext();
 		let result: SessionBeforeEventResult | undefined;
 
 		for (const ext of this.extensions) {

@@ -7,7 +7,7 @@
 
 import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ImageContent, Model } from "@mariozechner/pi-ai";
-import type { SessionStats } from "../../core/agent-session.js";
+import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 
@@ -93,6 +93,7 @@ export interface RpcSessionState {
 	thinkingLevel: ThinkingLevel;
 	isStreaming: boolean;
 	isCompacting: boolean;
+	isSettled: boolean;
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
 	sessionFile?: string;
@@ -110,9 +111,27 @@ export interface RpcSessionState {
 // Success responses with data
 export type RpcResponse =
 	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true }
-	| { id?: string; type: "response"; command: "steer"; success: true }
-	| { id?: string; type: "response"; command: "follow_up"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "prompt";
+			success: true;
+			data: { accepted: true; isSettled: boolean; hasLifecycle: boolean };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "steer";
+			success: true;
+			data: { accepted: true; isSettled: boolean; hasLifecycle: boolean };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "follow_up";
+			success: true;
+			data: { accepted: true; isSettled: boolean; hasLifecycle: boolean };
+	  }
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
 
@@ -203,6 +222,25 @@ export type RpcResponse =
 
 	// Error response (any command can fail)
 	| { id?: string; type: "response"; command: string; success: false; error: string };
+
+export interface RpcCommandErrorEvent {
+	type: "command_error";
+	command: string;
+	requestId?: string;
+	error: string;
+	isSettled: boolean;
+}
+
+export interface RpcExtensionErrorEvent {
+	type: "extension_error";
+	extensionPath: string;
+	event: string;
+	error: string;
+}
+
+export type RpcAgentSessionEvent = AgentSessionEvent & { requestId?: string };
+
+export type RpcEvent = RpcAgentSessionEvent | RpcCommandErrorEvent | RpcExtensionErrorEvent;
 
 // ============================================================================
 // Extension UI Events (stdout)

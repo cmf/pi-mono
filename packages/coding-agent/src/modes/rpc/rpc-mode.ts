@@ -20,8 +20,11 @@ import type {
 } from "../../core/extensions/index.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
+import { RpcLifecycleCoordinator } from "./rpc-lifecycle-coordinator.js";
 import type {
 	RpcCommand,
+	RpcCommandErrorEvent,
+	RpcExtensionErrorEvent,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcResponse,
@@ -43,7 +46,9 @@ export type {
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
 export async function runRpcMode(session: AgentSession): Promise<never> {
-	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+	const output = (
+		obj: RpcResponse | RpcExtensionUIRequest | RpcCommandErrorEvent | RpcExtensionErrorEvent | object,
+	) => {
 		process.stdout.write(serializeJsonLine(obj));
 	};
 
@@ -273,14 +278,20 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 		},
 	});
 
+	const lifecycleCoordinator = new RpcLifecycleCoordinator(output, () => session.isSettled);
+
 	// Set up extensions with RPC-based UI context
 	await session.bindExtensions({
 		uiContext: createExtensionUIContext(),
 		commandContextActions: {
 			waitForIdle: () => session.agent.waitForIdle(),
+			waitForSettled: () => session.waitForSettled(),
 			newSession: async (options) => {
 				// Delegate to AgentSession (handles setup + agent state sync)
 				const success = await session.newSession(options);
+				if (success) {
+					lifecycleCoordinator.cancelActiveRequests("new_session", session.isSettled);
+				}
 				return { cancelled: !success };
 			},
 			fork: async (entryId) => {
@@ -298,23 +309,28 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			},
 			switchSession: async (sessionPath) => {
 				const success = await session.switchSession(sessionPath);
+				if (success) {
+					lifecycleCoordinator.cancelActiveRequests("switch_session", session.isSettled);
+				}
 				return { cancelled: !success };
 			},
 			reload: async () => {
 				await session.reload();
+				lifecycleCoordinator.cancelActiveRequests("reload", session.isSettled);
 			},
 		},
 		shutdownHandler: () => {
 			shutdownRequested = true;
+			lifecycleCoordinator.cancelActiveRequests("shutdown", true);
 		},
 		onError: (err) => {
 			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
 		},
 	});
 
-	// Output all agent events as JSON
+	// Output all agent events as JSON through the lifecycle coordinator.
 	session.subscribe((event) => {
-		output(event);
+		lifecycleCoordinator.handleSessionEvent(event);
 	});
 
 	// Handle a single command
@@ -327,37 +343,66 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			// =================================================================
 
 			case "prompt": {
-				// Don't await - events will stream
-				// Extension commands are executed immediately, file prompt templates are expanded
-				// If streaming and streamingBehavior specified, queues via steer/followUp
-				session
-					.prompt(command.message, {
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-						source: "rpc",
-					})
-					.catch((e) => output(error(id, "prompt", e.message)));
-				return success(id, "prompt");
+				if (!id) {
+					return error(id, "prompt", "Prompt command requires an id");
+				}
+				try {
+					const data = await lifecycleCoordinator.submitPrompt(id, () =>
+						session.prompt(command.message, {
+							images: command.images,
+							streamingBehavior: command.streamingBehavior,
+							source: "rpc",
+						}),
+					);
+					return success(id, "prompt", data);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					return error(id, "prompt", message);
+				}
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images);
-				return success(id, "steer");
+				if (!id) {
+					return error(id, "steer", "Steer command requires an id");
+				}
+				try {
+					const data = await lifecycleCoordinator.submitQueuedCommand(id, "steer", () =>
+						session.steer(command.message, command.images),
+					);
+					return success(id, "steer", data);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					return error(id, "steer", message);
+				}
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images);
-				return success(id, "follow_up");
+				if (!id) {
+					return error(id, "follow_up", "Follow-up command requires an id");
+				}
+				try {
+					const data = await lifecycleCoordinator.submitQueuedCommand(id, "follow_up", () =>
+						session.followUp(command.message, command.images),
+					);
+					return success(id, "follow_up", data);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					return error(id, "follow_up", message);
+				}
 			}
 
 			case "abort": {
 				await session.abort();
+				lifecycleCoordinator.cancelActiveRequests("abort", session.isSettled);
 				return success(id, "abort");
 			}
 
 			case "new_session": {
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
 				const cancelled = !(await session.newSession(options));
+				if (!cancelled) {
+					lifecycleCoordinator.cancelActiveRequests("new_session", session.isSettled);
+				}
 				return success(id, "new_session", { cancelled });
 			}
 
@@ -371,6 +416,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 					thinkingLevel: session.thinkingLevel,
 					isStreaming: session.isStreaming,
 					isCompacting: session.isCompacting,
+					isSettled: session.isSettled,
 					steeringMode: session.steeringMode,
 					followUpMode: session.followUpMode,
 					sessionFile: session.sessionFile,
@@ -499,6 +545,9 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 			case "switch_session": {
 				const cancelled = !(await session.switchSession(command.sessionPath));
+				if (!cancelled) {
+					lifecycleCoordinator.cancelActiveRequests("switch_session", session.isSettled);
+				}
 				return success(id, "switch_session", { cancelled });
 			}
 

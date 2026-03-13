@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Fixed
+- Fixed settled tree mutations to abort if a newer turn lands before `fork()` or `navigateTree()` commits, preventing stale branch/session updates from applying.
+- Fixed RPC request lifecycle tracking to keep `command_error` terminal and stop correlating late `agent_end` events to failed requests.
 - Fixed custom tool collapsed/expanded rendering in HTML exports. Custom tools that define different collapsed vs expanded displays now render correctly in exported HTML, with expandable sections when both states differ and direct display when only expanded exists ([#1934](https://github.com/badlogic/pi-mono/pull/1934) by [@aliou](https://github.com/aliou))
 
 ## [0.57.0] - 2026-03-07
